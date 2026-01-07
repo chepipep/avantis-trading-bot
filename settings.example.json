@@ -1,0 +1,20 @@
+{
+  "rpc_url": "https://mainnet.base.org",
+  "private_key": "YOUR_PRIVATE_KEY_HERE",
+  "dry_run": true,
+  "pair_name": "BTC/USD",
+  "pair_index": 1,
+  "position_size": 10.0,
+  "leverage": 75,
+  "take_profit_pnl": 80,
+  "stop_loss_pnl": 80,
+  "entry_offset_min": 0.25,
+  "entry_offset_max": 1.0,
+  "reposition_threshold": 2.0,
+  "check_interval_min": 10,
+  "check_interval_max": 30,
+  "trading_start_hour": 13,
+  "trading_end_hour": 4,
+  "reposition_random": 0.5,
+  "trading_hours_variance": 15
+}

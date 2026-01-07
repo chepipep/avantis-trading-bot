@@ -1,0 +1,42 @@
+# ===========================================
+# PRIVATE FILES - NEVER UPLOAD TO GITHUB!
+# ===========================================
+
+# Your license keys database
+license.py
+
+# Settings with private key
+settings.json
+
+# ===========================================
+# Python
+# ===========================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+.env
+venv/
+.venv/
+env/
+ENV/
+
+# ===========================================
+# IDE
+# ===========================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.claude/
+
+# ===========================================
+# Other
+# ===========================================
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
