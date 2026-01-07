@@ -628,15 +628,15 @@ class App(ctk.CTk):
             asyncio.set_event_loop(loop)
 
             loop.run_until_complete(trader.cancel_order(
-                pair_index=order.pairIndex,
-                trade_index=order.index,
+                pair_index=order.pair_index,
+                trade_index=order.trade_index,
                 dry_run=config.DRY_RUN
             ))
 
             loop.close()
 
             side = "LONG" if order.buy else "SHORT"
-            self.after(0, lambda: self.log(f"Cancelled {side} order #{order.index}"))
+            self.after(0, lambda: self.log(f"Cancelled {side} order #{order.trade_index}"))
             self.after(0, self.check_orders_async)
 
         except Exception as e:
@@ -668,11 +668,11 @@ class App(ctk.CTk):
             for order in self.pending_orders:
                 try:
                     loop.run_until_complete(trader.cancel_order(
-                        pair_index=order.pairIndex,
-                        trade_index=order.index,
+                        pair_index=order.pair_index,
+                        trade_index=order.trade_index,
                         dry_run=config.DRY_RUN
                     ))
-                    self.after(0, lambda: self.log(f"Cancelled order #{order.index}"))
+                    self.after(0, lambda: self.log(f"Cancelled order #{order.trade_index}"))
                     loop.run_until_complete(asyncio.sleep(random.uniform(1, 2)))
                 except Exception as e:
                     self.after(0, lambda e=e: self.log(f"Cancel error: {e}"))
@@ -945,6 +945,15 @@ class App(ctk.CTk):
             border_width=1, border_color=COLORS["border"]
         )
         self.log_text.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+
+        # Prevent scroll propagation to parent
+        def on_mousewheel(event):
+            self.log_text._textbox.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+
+        self.log_text.bind("<MouseWheel>", on_mousewheel)
+        self.log_text._textbox.bind("<MouseWheel>", on_mousewheel)
+
         self.log("Delta-Neutral Bot v4.1")
         self.log("Ready...")
 

@@ -214,8 +214,8 @@ async def main():
                     for order in pending:
                         try:
                             await trader.cancel_order(
-                                pair_index=order.pairIndex,
-                                trade_index=order.index,
+                                pair_index=order.pair_index,
+                                trade_index=order.trade_index,
                                 dry_run=False
                             )
                             await asyncio.sleep(random.uniform(1, 2))
@@ -296,8 +296,8 @@ async def main():
                     for order in pending:
                         try:
                             await trader.cancel_order(
-                                pair_index=order.pairIndex,
-                                trade_index=order.index,
+                                pair_index=order.pair_index,
+                                trade_index=order.trade_index,
                                 dry_run=False
                             )
                             await asyncio.sleep(random.uniform(1, 2))
