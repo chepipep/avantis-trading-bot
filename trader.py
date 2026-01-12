@@ -134,6 +134,67 @@ class AvantisTrader:
         print(f"[{side}] {order_type_name} at ${limit_price:.2f}: {tx_hash}")
         return tx_hash
 
+    async def place_market_order(
+        self,
+        pair_index: int,
+        is_long: bool,
+        collateral: float,
+        leverage: int,
+        tp_price: float,
+        sl_price: float,
+        dry_run: bool = True
+    ) -> str:
+        """
+        Place a MARKET order on Avantis.
+
+        Args:
+            pair_index: Index of the trading pair (1 = BTC/USD)
+            is_long: True for LONG, False for SHORT
+            collateral: Collateral in USDC
+            leverage: Leverage multiplier
+            tp_price: Take profit price
+            sl_price: Stop loss price
+            dry_run: If True, don't send transaction
+
+        Returns:
+            Transaction hash or "DRY_RUN"
+        """
+        side = "LONG" if is_long else "SHORT"
+
+        if dry_run:
+            print(f"[DRY-RUN] Placing {side} MARKET order:")
+            print(f"  Pair Index: {pair_index}")
+            print(f"  Collateral: {collateral} USDC")
+            print(f"  Leverage: {leverage}x")
+            print(f"  TP Price: {tp_price:.2f}")
+            print(f"  SL Price: {sl_price:.2f}")
+            return "DRY_RUN"
+
+        # Create trade input (open_price=0 for market order)
+        trade_input = TradeInput(
+            trader=self.wallet,
+            pair_index=pair_index,
+            is_long=is_long,
+            leverage=leverage,
+            collateral_in_trade=collateral,
+            open_price=0,
+            tp=tp_price,
+            sl=sl_price
+        )
+
+        tx = await self.client.trade.build_trade_open_tx(
+            trade_input=trade_input,
+            trade_input_order_type=TradeInputOrderType.MARKET,
+            slippage_percentage=1
+        )
+
+        # Sign and send
+        receipt = await self.client.sign_and_get_receipt(tx)
+
+        tx_hash = receipt["transactionHash"].hex()
+        print(f"[{side}] MARKET order executed: {tx_hash}")
+        return tx_hash
+
     async def cancel_order(
         self,
         pair_index: int,
@@ -210,6 +271,57 @@ class AvantisTrader:
 
         tx_hash = receipt["transactionHash"].hex()
         print(f"[CLOSE] Position closed: {tx_hash}")
+        return tx_hash
+
+    async def update_sl(
+        self,
+        pair_index: int,
+        trade_index: int,
+        new_sl: float,
+        dry_run: bool = True
+    ) -> str:
+        """
+        Update stop loss for an open position.
+
+        Args:
+            pair_index: Index of the trading pair
+            trade_index: Index of the trade
+            new_sl: New stop loss price (0 to remove SL)
+            dry_run: If True, don't send transaction
+
+        Returns:
+            Transaction hash or "DRY_RUN"
+        """
+        if dry_run:
+            print(f"[DRY-RUN] Updating SL:")
+            print(f"  Pair Index: {pair_index}")
+            print(f"  Trade Index: {trade_index}")
+            print(f"  New SL: {new_sl}")
+            return "DRY_RUN"
+
+        # Get current trade to preserve TP
+        trades, _ = await self.get_open_trades()
+        current_tp = 0
+        for trade in trades:
+            inner = getattr(trade, 'trade', trade)
+            if inner.pair_index == pair_index and inner.trade_index == trade_index:
+                current_tp = getattr(inner, 'tp', 0)
+                break
+
+        # Build update transaction
+        tx = await self.client.trade.build_trade_tp_sl_update_tx(
+            trader=self.wallet,
+            pair_index=pair_index,
+            trade_index=trade_index,
+            new_tp=current_tp,
+            new_sl=new_sl
+        )
+
+        # Sign and send
+        receipt = await self.client.sign_and_get_receipt(tx)
+
+        tx_hash = receipt["transactionHash"].hex()
+        print(f"[UPDATE SL] SL updated to {new_sl}: {tx_hash}")
         return tx_hash
 
     async def get_open_trades(self):

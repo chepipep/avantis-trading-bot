@@ -15,5 +15,5 @@ async def place_limit_order(
         print(f"[DRY-RUN] {side} @ {price} | TP={tp} SL={sl}")
         return
 
-    # Real TradeInput implementation
-    # (handled by trader.py)
+    # здесь потом реальный TradeInput
+    # (когда захочешь — включим боевой режим)

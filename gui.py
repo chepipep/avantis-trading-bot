@@ -5,7 +5,12 @@ import threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+# System tray support
+import pystray
+from PIL import Image, ImageDraw
+
 SETTINGS_FILE = Path(__file__).parent / "settings.json"
+LOG_FILE = Path(__file__).parent / "bot.log"
 MSK = timezone(timedelta(hours=3))
 
 # Dark theme + soft yellow
@@ -46,6 +51,15 @@ DEFAULT_SETTINGS = {
     "trading_start_hour": 13,
     "trading_end_hour": 4,
     "trading_variance": 15,
+    "xp_price_per_1000": 0.0,
+    # Strategy settings
+    "bot_mode": "delta",  # "delta" or "strategy"
+    # Funding Reversal strategy settings
+    "strategy_position_size": 1.0,
+    "strategy_leverage": 10,
+    "strategy_stop_loss_pct": 0.7,
+    "strategy_tp1_pct": 1.0,
+    "strategy_max_trades": 3,
 }
 
 
@@ -102,12 +116,21 @@ class App(ctk.CTk):
         self.bot_thread = None
         self.pending_orders = []
         self.open_trades = []
+        self.current_price = 0
         self.license_valid = False
+        self.tray_icon = None
+        self._quitting = False
 
         self.title("Delta-Neutral Bot")
-        self.geometry("880x780")
+        self.geometry("880x920")
         self.configure(fg_color=COLORS["bg"])
         ctk.set_appearance_mode("dark")
+
+        # Override close button to minimize to tray
+        self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+
+        # Setup system tray
+        self.setup_tray()
 
         # Check license first
         if not self.check_license():
@@ -116,19 +139,78 @@ class App(ctk.CTk):
 
         self.create_main_ui()
 
+    def create_tray_icon(self):
+        """Create a simple icon for system tray."""
+        size = 64
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Yellow circle with D letter
+        draw.ellipse([4, 4, size-4, size-4], fill='#f0c674')
+        draw.text((size//2 - 8, size//2 - 12), "D", fill='#1a1a1a',
+                  font=None)  # Default font
+        return img
+
+    def setup_tray(self):
+        """Setup system tray icon with menu."""
+        icon_image = self.create_tray_icon()
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Show", self.show_from_tray, default=True),
+            pystray.MenuItem("Exit", self.quit_app)
+        )
+
+        self.tray_icon = pystray.Icon(
+            "delta_bot",
+            icon_image,
+            "Delta-Neutral Bot",
+            menu
+        )
+
+        # Run tray icon in separate thread
+        tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
+        tray_thread.start()
+
+    def hide_to_tray(self):
+        """Hide window to system tray instead of closing."""
+        if self._quitting:
+            return
+        self.withdraw()  # Hide window
+
+    def show_from_tray(self, icon=None, item=None):
+        """Show window from system tray."""
+        self.after(0, self._show_window)
+
+    def _show_window(self):
+        """Restore window (must be called from main thread)."""
+        self.deiconify()  # Show window
+        self.lift()  # Bring to front
+        self.focus_force()
+
+    def quit_app(self, icon=None, item=None):
+        """Completely quit the application."""
+        self._quitting = True
+        if self.bot_running:
+            self.stop_bot()
+        if self.tray_icon:
+            self.tray_icon.stop()
+        self.after(0, self.destroy)
+
     def create_main_ui(self):
         # Scrollable container for small windows
         scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=24, pady=20)
+        self._main_scroll = scroll
 
         self.create_header(scroll)
         self.create_pair_panel(scroll)
         self.create_stats(scroll)
         self.create_orders_panel(scroll)
         self.create_cards(scroll)
+        self.create_strategy_panel(scroll)
         self.create_log(scroll)
         self.create_footer(scroll)
         self.load_pk_from_config()
+        self._update_panels_visibility()
 
         # Check orders on startup
         self.after(500, self.check_orders_async)
@@ -251,6 +333,24 @@ class App(ctk.CTk):
         right = ctk.CTkFrame(header, fg_color="transparent")
         right.pack(side="right")
 
+        # Bot mode selector (Delta-Neutral / Strategy)
+        self.bot_mode_var = ctk.StringVar(
+            value="STRATEGY" if self.settings.get("bot_mode") == "strategy" else "DELTA"
+        )
+        self.bot_mode_btn = ctk.CTkSegmentedButton(
+            right, values=["DELTA", "STRATEGY"],
+            variable=self.bot_mode_var, command=self.on_bot_mode_change,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLORS["border"],
+            selected_color="#6a9fb5",
+            selected_hover_color="#5a8fa5",
+            unselected_color=COLORS["card"],
+            text_color=COLORS["bg"],
+            corner_radius=8
+        )
+        self.bot_mode_btn.pack(pady=(0, 6))
+
+        # Dry/Live mode selector
         self.mode_var = ctk.StringVar(value="DRY RUN" if self.settings["dry_run"] else "LIVE")
         self.mode_btn = ctk.CTkSegmentedButton(
             right, values=["DRY RUN", "LIVE"],
@@ -356,24 +456,47 @@ class App(ctk.CTk):
             self.after(0, lambda: self.price_label.configure(text="Error"))
 
     def create_stats(self, parent):
-        stats = ctk.CTkFrame(parent, fg_color="transparent")
-        stats.pack(fill="x", pady=(0, 14))
+        # Delta stats panel
+        self.delta_stats = ctk.CTkFrame(parent, fg_color="transparent")
+        self.delta_stats.pack(fill="x", pady=(0, 14))
 
         mode = "DRY" if self.settings["dry_run"] else "LIVE"
         mode_color = COLORS["primary"] if self.settings["dry_run"] else COLORS["danger"]
 
-        self.stat_mode = StatBox(stats, "MODE", mode, mode_color)
+        self.stat_mode = StatBox(self.delta_stats, "MODE", mode, mode_color)
         self.stat_mode.pack(side="left", fill="x", expand=True, padx=(0, 5))
 
-        self.stat_leverage = StatBox(stats, "LEVERAGE", f"{self.settings['leverage']}x")
+        self.stat_leverage = StatBox(self.delta_stats, "LEVERAGE", f"{self.settings['leverage']}x")
         self.stat_leverage.pack(side="left", fill="x", expand=True, padx=5)
 
-        self.stat_position = StatBox(stats, "POSITION", f"${self.settings['position_size']:.0f}")
+        self.stat_position = StatBox(self.delta_stats, "POSITION", f"${self.settings['position_size']:.0f}")
         self.stat_position.pack(side="left", fill="x", expand=True, padx=5)
 
-        self.stat_entry = StatBox(stats, "ENTRY",
+        self.stat_entry = StatBox(self.delta_stats, "ENTRY",
             f"{self.settings['entry_offset_min']}-{self.settings['entry_offset_max']}%")
         self.stat_entry.pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+        # Strategy stats panel (initially hidden)
+        self.strategy_stats = ctk.CTkFrame(parent, fg_color="transparent")
+
+        mode = "DRY" if self.settings["dry_run"] else "LIVE"
+        mode_color = COLORS["primary"] if self.settings["dry_run"] else COLORS["danger"]
+
+        self.strategy_stat_mode = StatBox(self.strategy_stats, "MODE", mode, mode_color)
+        self.strategy_stat_mode.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        self.strategy_stat_leverage = StatBox(self.strategy_stats, "LEVERAGE",
+            f"{self.settings.get('strategy_leverage', 10)}x")
+        self.strategy_stat_leverage.pack(side="left", fill="x", expand=True, padx=5)
+
+        self.strategy_stat_position = StatBox(self.strategy_stats, "POSITION",
+            f"${self.settings.get('strategy_position_size', 1.0):.1f}")
+        self.strategy_stat_position.pack(side="left", fill="x", expand=True, padx=5)
+
+        self.strategy_stat_sl = StatBox(self.strategy_stats, "STOP LOSS",
+            f"{self.settings.get('strategy_stop_loss_pct', 0.7):.1f}%")
+        self.strategy_stat_sl.pack(side="left", fill="x", expand=True, padx=(5, 0))
+
 
     def create_orders_panel(self, parent):
         self.orders_card = Card(parent, title="OPEN ORDERS")
@@ -440,6 +563,7 @@ class App(ctk.CTk):
         try:
             self.apply_settings_to_config()
             from trader import AvantisTrader
+            from price import get_pair_price
             import config
 
             trader = AvantisTrader(config.RPC_URL, config.PRIVATE_KEY)
@@ -447,10 +571,13 @@ class App(ctk.CTk):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             trades, pending = loop.run_until_complete(trader.get_open_trades())
+            # Get current price for PnL calculation
+            current_price = loop.run_until_complete(get_pair_price(config.PAIR_NAME))
             loop.close()
 
             self.open_trades = trades
             self.pending_orders = pending
+            self.current_price = current_price
 
             self.after(0, self._update_orders_ui)
         except Exception as e:
@@ -476,6 +603,10 @@ class App(ctk.CTk):
             status_parts.append(f"{n_trades} position(s)")
         if n_pending > 0:
             status_parts.append(f"{n_pending} pending order(s)")
+        # Show current price used for PnL
+        current_price = getattr(self, 'current_price', 0)
+        if current_price > 0:
+            status_parts.append(f"@ ${current_price:,.2f}")
 
         self.orders_status_label.configure(text=" | ".join(status_parts))
         self.cancel_orders_btn.configure(state="normal" if n_pending > 0 else "disabled")
@@ -495,6 +626,9 @@ class App(ctk.CTk):
         row.pack(fill="x", pady=3)
         row.pack_propagate(False)
 
+        # Extract order data (pending orders may have different structure)
+        data = self._get_trade_data(order)
+
         # Cancel button (X) on the left
         cancel_btn = ctk.CTkButton(
             row, text="✕", width=32, height=32,
@@ -509,8 +643,10 @@ class App(ctk.CTk):
         left = ctk.CTkFrame(row, fg_color="transparent")
         left.pack(side="left", padx=(8, 0), pady=8)
 
-        side = "LONG" if order.buy else "SHORT"
-        side_color = "#4CAF50" if order.buy else "#F44336"
+        # Pending orders use 'buy', trades use 'is_long'
+        is_long = getattr(order, 'buy', data['is_long'])
+        side = "LONG" if is_long else "SHORT"
+        side_color = "#4CAF50" if is_long else "#F44336"
 
         top_left = ctk.CTkFrame(left, fg_color="transparent")
         top_left.pack(anchor="w")
@@ -519,23 +655,23 @@ class App(ctk.CTk):
         ctk.CTkLabel(top_left, text=side, font=ctk.CTkFont(size=12, weight="bold"),
                     text_color=side_color).pack(side="left")
 
-        # Price and leverage
-        price = getattr(order, 'price', getattr(order, 'openPrice', 0))
-        leverage = getattr(order, 'leverage', 0)
+        # Price and leverage - pending orders use 'price' field
+        price = getattr(order, 'price', data['open_price'])
+        leverage = data['leverage']
         bottom_left = ctk.CTkFrame(left, fg_color="transparent")
         bottom_left.pack(anchor="w", pady=(2, 0))
         ctk.CTkLabel(bottom_left, text=f"Entry: ${price:,.2f}",
                     font=ctk.CTkFont(size=11), text_color=COLORS["text"]).pack(side="left")
-        ctk.CTkLabel(bottom_left, text=f"  {leverage}x",
+        ctk.CTkLabel(bottom_left, text=f"  {int(leverage)}x",
                     font=ctk.CTkFont(size=11, weight="bold"), text_color=COLORS["primary"]).pack(side="left")
 
         # Right side - TP/SL and collateral
         right = ctk.CTkFrame(row, fg_color="transparent")
         right.pack(side="right", padx=(0, 12), pady=8)
 
-        collateral = getattr(order, 'open_collateral', getattr(order, 'openCollateral', 0))
-        tp = getattr(order, 'tp', 0)
-        sl = getattr(order, 'sl', 0)
+        collateral = data['open_collateral'] or data['collateral']
+        tp = data['tp']
+        sl = data['sl']
 
         top_right = ctk.CTkFrame(right, fg_color="transparent")
         top_right.pack(anchor="e")
@@ -550,19 +686,52 @@ class App(ctk.CTk):
         ctk.CTkLabel(bottom_right, text=f"SL: ${sl:,.0f}",
                     font=ctk.CTkFont(size=10), text_color="#F44336").pack(side="left")
 
+    def _get_trade_data(self, trade_obj):
+        """Extract trade data from TradeExtendedResponse or flat object."""
+        # TradeExtendedResponse has nested .trade attribute
+        inner = getattr(trade_obj, 'trade', trade_obj)
+        return {
+            'is_long': getattr(inner, 'is_long', getattr(inner, 'buy', False)),
+            'open_price': getattr(inner, 'open_price', getattr(inner, 'openPrice', 0)),
+            'leverage': getattr(inner, 'leverage', 0),
+            'collateral': getattr(inner, 'collateral_in_trade', getattr(inner, 'collateralInTrade', 0)),
+            'open_collateral': getattr(inner, 'open_collateral', getattr(inner, 'openCollateral', 0)),
+            'tp': getattr(inner, 'tp', 0),
+            'sl': getattr(inner, 'sl', 0),
+            'pair_index': getattr(inner, 'pair_index', 0),
+            'trade_index': getattr(inner, 'trade_index', 0),
+        }
+
     def _add_trade_row(self, trade):
         row = ctk.CTkFrame(self.orders_list_frame, fg_color=COLORS["card"],
-                          corner_radius=8, height=58, border_width=1,
+                          corner_radius=8, height=62, border_width=1,
                           border_color="#4CAF50")
         row.pack(fill="x", pady=3)
         row.pack_propagate(False)
+
+        # Extract trade data from nested structure
+        data = self._get_trade_data(trade)
+
+        # Calculate current PnL
+        entry_price = data['open_price']
+        leverage = data['leverage']
+        collateral = data['open_collateral'] or data['collateral']
+        current_price = getattr(self, 'current_price', entry_price) or entry_price
+
+        if data['is_long']:
+            pnl_pct = (current_price - entry_price) / entry_price * leverage
+        else:
+            pnl_pct = (entry_price - current_price) / entry_price * leverage
+
+        pnl_usd = pnl_pct * collateral
+        pnl_color = "#4CAF50" if pnl_usd >= 0 else COLORS["danger"]
 
         # Left side - status and side
         left = ctk.CTkFrame(row, fg_color="transparent")
         left.pack(side="left", padx=(12, 0), pady=8)
 
-        side = "LONG" if getattr(trade, 'buy', getattr(trade, 'is_long', False)) else "SHORT"
-        side_color = "#4CAF50" if side == "LONG" else "#F44336"
+        side = "LONG" if data['is_long'] else "SHORT"
+        side_color = "#4CAF50" if data['is_long'] else "#F44336"
 
         top_left = ctk.CTkFrame(left, fg_color="transparent")
         top_left.pack(anchor="w")
@@ -572,26 +741,34 @@ class App(ctk.CTk):
                     text_color=side_color).pack(side="left")
 
         # Price and leverage
-        price = getattr(trade, 'open_price', getattr(trade, 'openPrice', 0))
-        leverage = getattr(trade, 'leverage', 0)
         bottom_left = ctk.CTkFrame(left, fg_color="transparent")
         bottom_left.pack(anchor="w", pady=(2, 0))
-        ctk.CTkLabel(bottom_left, text=f"Entry: ${price:,.2f}",
+        ctk.CTkLabel(bottom_left, text=f"Entry: ${entry_price:,.2f}",
                     font=ctk.CTkFont(size=11), text_color=COLORS["text"]).pack(side="left")
-        ctk.CTkLabel(bottom_left, text=f"  {leverage}x",
+        ctk.CTkLabel(bottom_left, text=f"  {int(leverage)}x",
                     font=ctk.CTkFont(size=11, weight="bold"), text_color=COLORS["primary"]).pack(side="left")
+
+        # Center - PnL display
+        center = ctk.CTkFrame(row, fg_color="transparent")
+        center.pack(side="left", padx=(20, 0), pady=8)
+
+        ctk.CTkLabel(center, text=f"${pnl_usd:+.2f}",
+                    font=ctk.CTkFont(size=14, weight="bold"),
+                    text_color=pnl_color).pack(anchor="w")
+        ctk.CTkLabel(center, text=f"{pnl_pct*100:+.2f}%",
+                    font=ctk.CTkFont(size=10),
+                    text_color=pnl_color).pack(anchor="w")
 
         # Right side - TP/SL and collateral
         right = ctk.CTkFrame(row, fg_color="transparent")
         right.pack(side="right", padx=(0, 12), pady=8)
 
-        collateral = getattr(trade, 'collateral_in_trade', getattr(trade, 'collateralInTrade', 0))
-        tp = getattr(trade, 'tp', 0)
-        sl = getattr(trade, 'sl', 0)
+        tp = data['tp']
+        sl = data['sl']
 
         top_right = ctk.CTkFrame(right, fg_color="transparent")
         top_right.pack(anchor="e")
-        ctk.CTkLabel(top_right, text=f"${collateral:.1f}",
+        ctk.CTkLabel(top_right, text=f"${collateral:.2f}",
                     font=ctk.CTkFont(size=13, weight="bold"),
                     text_color=COLORS["text"]).pack(side="right")
 
@@ -783,9 +960,11 @@ class App(ctk.CTk):
             self.after(0, lambda: self._orders_error(str(e)))
 
     def create_cards(self, parent):
-        cards = ctk.CTkFrame(parent, fg_color="transparent")
-        cards.pack(fill="x", pady=(0, 10))
-        cards.grid_columnconfigure((0, 1), weight=1)
+        # Delta settings cards
+        self.delta_cards = ctk.CTkFrame(parent, fg_color="transparent")
+        self.delta_cards.pack(fill="x", pady=(0, 10))
+        self.delta_cards.grid_columnconfigure((0, 1), weight=1)
+        cards = self.delta_cards  # Alias for compatibility
 
         pos = Card(cards, title="POSITION")
         pos.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
@@ -871,6 +1050,163 @@ class App(ctk.CTk):
         self.hours_preview.pack(anchor="w", pady=(4, 0))
         self._update_hours_preview()
 
+    def create_strategy_panel(self, parent):
+        """Create Funding Reversal strategy settings panel."""
+        self.strategy_card = Card(parent, title="FUNDING REVERSAL STRATEGY")
+        self.strategy_card.pack(fill="x", pady=(0, 10))
+
+        content = ctk.CTkFrame(self.strategy_card, fg_color="transparent")
+        content.pack(fill="x", padx=16, pady=(0, 12))
+
+        # Info about strategy
+        info = ctk.CTkLabel(content,
+            text="Contrarian strategy: trades against crowd on false breakouts",
+            font=ctk.CTkFont(size=10),
+            text_color=COLORS["text_dim"])
+        info.pack(anchor="w", pady=(0, 10))
+
+        # Row 1: Position size, Leverage
+        row1 = ctk.CTkFrame(content, fg_color="transparent")
+        row1.pack(fill="x", pady=(0, 8))
+        row1.grid_columnconfigure((0, 1), weight=1)
+
+        # Position Size
+        f_pos = ctk.CTkFrame(row1, fg_color="transparent")
+        f_pos.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ctk.CTkLabel(f_pos, text="Position $", font=ctk.CTkFont(size=10),
+                    text_color=COLORS["text_secondary"]).pack(anchor="w")
+        self.strategy_position_entry = ctk.CTkEntry(f_pos, height=34, corner_radius=8,
+                        fg_color=COLORS["input"], border_color=COLORS["border"],
+                        text_color=COLORS["text"], font=ctk.CTkFont(size=12))
+        self.strategy_position_entry.insert(0, str(self.settings.get("strategy_position_size", 1.0)))
+        self.strategy_position_entry.pack(fill="x", pady=(3, 0))
+        self.strategy_position_entry.bind("<FocusOut>", lambda e: self._save_strategy_settings())
+
+        # Leverage
+        f_lev = ctk.CTkFrame(row1, fg_color="transparent")
+        f_lev.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ctk.CTkLabel(f_lev, text="Leverage", font=ctk.CTkFont(size=10),
+                    text_color=COLORS["text_secondary"]).pack(anchor="w")
+        self.strategy_leverage_entry = ctk.CTkEntry(f_lev, height=34, corner_radius=8,
+                        fg_color=COLORS["input"], border_color=COLORS["border"],
+                        text_color=COLORS["text"], font=ctk.CTkFont(size=12))
+        self.strategy_leverage_entry.insert(0, str(self.settings.get("strategy_leverage", 10)))
+        self.strategy_leverage_entry.pack(fill="x", pady=(3, 0))
+        self.strategy_leverage_entry.bind("<FocusOut>", lambda e: self._save_strategy_settings())
+
+        # Row 2: SL, TP1, Max Trades
+        row2 = ctk.CTkFrame(content, fg_color="transparent")
+        row2.pack(fill="x")
+        row2.grid_columnconfigure((0, 1, 2), weight=1)
+
+        # Stop Loss %
+        f_sl = ctk.CTkFrame(row2, fg_color="transparent")
+        f_sl.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ctk.CTkLabel(f_sl, text="SL %", font=ctk.CTkFont(size=10),
+                    text_color=COLORS["text_secondary"]).pack(anchor="w")
+        self.strategy_sl_entry = ctk.CTkEntry(f_sl, height=34, corner_radius=8,
+                        fg_color=COLORS["input"], border_color=COLORS["border"],
+                        text_color=COLORS["text"], font=ctk.CTkFont(size=12))
+        self.strategy_sl_entry.insert(0, str(self.settings.get("strategy_stop_loss_pct", 0.7)))
+        self.strategy_sl_entry.pack(fill="x", pady=(3, 0))
+        self.strategy_sl_entry.bind("<FocusOut>", lambda e: self._save_strategy_settings())
+
+        # TP1 %
+        f_tp = ctk.CTkFrame(row2, fg_color="transparent")
+        f_tp.grid(row=0, column=1, sticky="ew", padx=4)
+        ctk.CTkLabel(f_tp, text="TP1 %", font=ctk.CTkFont(size=10),
+                    text_color=COLORS["text_secondary"]).pack(anchor="w")
+        self.strategy_tp1_entry = ctk.CTkEntry(f_tp, height=34, corner_radius=8,
+                        fg_color=COLORS["input"], border_color=COLORS["border"],
+                        text_color=COLORS["text"], font=ctk.CTkFont(size=12))
+        self.strategy_tp1_entry.insert(0, str(self.settings.get("strategy_tp1_pct", 1.0)))
+        self.strategy_tp1_entry.pack(fill="x", pady=(3, 0))
+        self.strategy_tp1_entry.bind("<FocusOut>", lambda e: self._save_strategy_settings())
+
+        # Max Trades
+        f_max = ctk.CTkFrame(row2, fg_color="transparent")
+        f_max.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        ctk.CTkLabel(f_max, text="Max Trades/Day", font=ctk.CTkFont(size=10),
+                    text_color=COLORS["text_secondary"]).pack(anchor="w")
+        self.strategy_max_trades_entry = ctk.CTkEntry(f_max, height=34, corner_radius=8,
+                        fg_color=COLORS["input"], border_color=COLORS["border"],
+                        text_color=COLORS["text"], font=ctk.CTkFont(size=12))
+        self.strategy_max_trades_entry.insert(0, str(self.settings.get("strategy_max_trades", 3)))
+        self.strategy_max_trades_entry.pack(fill="x", pady=(3, 0))
+        self.strategy_max_trades_entry.bind("<FocusOut>", lambda e: self._save_strategy_settings())
+
+    def _save_strategy_settings(self):
+        """Save strategy settings."""
+        try:
+            self.settings["strategy_position_size"] = float(self.strategy_position_entry.get().strip() or 1.0)
+        except ValueError:
+            pass
+        try:
+            self.settings["strategy_leverage"] = int(self.strategy_leverage_entry.get().strip() or 10)
+        except ValueError:
+            pass
+        try:
+            self.settings["strategy_stop_loss_pct"] = float(self.strategy_sl_entry.get().strip() or 0.7)
+        except ValueError:
+            pass
+        try:
+            self.settings["strategy_tp1_pct"] = float(self.strategy_tp1_entry.get().strip() or 1.0)
+        except ValueError:
+            pass
+        try:
+            self.settings["strategy_max_trades"] = int(self.strategy_max_trades_entry.get().strip() or 3)
+        except ValueError:
+            pass
+        save_settings(self.settings)
+        self._update_strategy_stats()
+
+    def _update_strategy_stats(self):
+        """Update strategy stats display."""
+        if hasattr(self, 'strategy_stat_leverage'):
+            self.strategy_stat_leverage.set_value(f"{self.settings.get('strategy_leverage', 10)}x")
+        if hasattr(self, 'strategy_stat_position'):
+            self.strategy_stat_position.set_value(f"${self.settings.get('strategy_position_size', 1.0):.1f}")
+        if hasattr(self, 'strategy_stat_sl'):
+            self.strategy_stat_sl.set_value(f"{self.settings.get('strategy_stop_loss_pct', 0.7):.1f}%")
+
+    def on_bot_mode_change(self, value):
+        """Handle bot mode change (DELTA / STRATEGY)."""
+        self.settings["bot_mode"] = "strategy" if value == "STRATEGY" else "delta"
+        save_settings(self.settings)
+        self._update_panels_visibility()
+        self.log(f"Bot mode: {value}")
+
+    def _update_panels_visibility(self):
+        """Show/hide panels based on bot mode."""
+        is_strategy = self.settings.get("bot_mode") == "strategy"
+
+        # Hide/show Delta-specific panels
+        if hasattr(self, 'delta_stats'):
+            if is_strategy:
+                self.delta_stats.pack_forget()
+            else:
+                self.delta_stats.pack(fill="x", pady=(0, 14), before=self.orders_card)
+
+        # Hide/show Strategy stats
+        if hasattr(self, 'strategy_stats'):
+            if is_strategy:
+                self.strategy_stats.pack(fill="x", pady=(0, 14), before=self.orders_card)
+            else:
+                self.strategy_stats.pack_forget()
+
+        if hasattr(self, 'delta_cards'):
+            if is_strategy:
+                self.delta_cards.pack_forget()
+            else:
+                self.delta_cards.pack(fill="x", pady=(0, 10), before=self.log_card)
+
+        # Hide/show Strategy settings panel
+        if hasattr(self, 'strategy_card'):
+            if is_strategy:
+                self.strategy_card.pack(fill="x", pady=(0, 10), before=self.log_card)
+            else:
+                self.strategy_card.pack_forget()
+
     def _field(self, parent, label, key, cast=float):
         f = ctk.CTkFrame(parent, fg_color="transparent")
         f.pack(fill="x", pady=(0, 8))
@@ -936,10 +1272,10 @@ class App(ctk.CTk):
             pass
 
     def create_log(self, parent):
-        log = Card(parent, title="LOG")
-        log.pack(fill="both", expand=True, pady=(0, 10))
+        self.log_card = Card(parent, title="LOG")
+        self.log_card.pack(fill="both", expand=True, pady=(0, 10))
         self.log_text = ctk.CTkTextbox(
-            log, height=100, corner_radius=8,
+            self.log_card, height=100, corner_radius=8,
             fg_color=COLORS["input"], text_color=COLORS["text"],
             font=ctk.CTkFont(family="Consolas", size=10),
             border_width=1, border_color=COLORS["border"]
@@ -986,14 +1322,25 @@ class App(ctk.CTk):
 
     def log(self, msg):
         ts = datetime.now(MSK).strftime("%H:%M:%S")
-        self.log_text.insert("end", f"[{ts}] {msg}\n")
+        line = f"[{ts}] {msg}\n"
+        self.log_text.insert("end", line)
         self.log_text.see("end")
+        # Сохраняем в файл
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now(MSK).strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        except:
+            pass
 
     def on_mode_change(self, value):
         self.settings["dry_run"] = (value == "DRY RUN")
         save_settings(self.settings)
-        self.stat_mode.set_value("DRY" if self.settings["dry_run"] else "LIVE",
-            COLORS["primary"] if self.settings["dry_run"] else COLORS["danger"])
+        mode_text = "DRY" if self.settings["dry_run"] else "LIVE"
+        mode_color = COLORS["primary"] if self.settings["dry_run"] else COLORS["danger"]
+        # Update both stat displays
+        self.stat_mode.set_value(mode_text, mode_color)
+        if hasattr(self, 'strategy_stat_mode'):
+            self.strategy_stat_mode.set_value(mode_text, mode_color)
         self.log(f"Mode: {value}")
 
     def update_stats(self):
@@ -1072,18 +1419,34 @@ class App(ctk.CTk):
         if not self.settings.get("private_key"):
             self.log("ERROR: No private key!")
             return
+
+        is_strategy = self.settings.get("bot_mode") == "strategy"
+
         if not self.settings["dry_run"]:
             self.log("WARNING: LIVE mode!")
 
         self.bot_running = True
+        self.engine = None
         self.start_btn.configure(text="STOP BOT", fg_color=COLORS["danger"], hover_color="#c04040")
         self.apply_settings_to_config()
-        self.bot_thread = threading.Thread(target=self.run_bot_thread, daemon=True)
+
+        if is_strategy:
+            self.bot_thread = threading.Thread(target=self.run_strategy_thread, daemon=True)
+            self.log("Starting Funding Reversal strategy...")
+        else:
+            self.bot_thread = threading.Thread(target=self.run_bot_thread, daemon=True)
+            self.log("Starting Delta-Neutral bot...")
+
         self.bot_thread.start()
-        self.log("Bot started!")
 
     def stop_bot(self):
         self.bot_running = False
+        # Stop engine if running
+        if hasattr(self, 'engine') and self.engine:
+            self.engine.stop()
+        # Stop strategy runner if running
+        if hasattr(self, 'strategy_runner') and self.strategy_runner:
+            self.strategy_runner.stop()
         self.start_btn.configure(text="START BOT", fg_color=COLORS["primary"],
                                 hover_color=COLORS["primary_dark"])
         self.log("Bot stopped!")
@@ -1120,12 +1483,105 @@ class App(ctk.CTk):
             def flush(s): pass
 
         old = sys.stdout
-        sys.stdout = R(lambda m: self.after(0, lambda: self.log(m)))
+        sys.stdout = R(lambda m: self.after(0, lambda msg=m: self.log(msg)))
         try:
-            from main import main
-            asyncio.run(main())
+            from engine import TradingEngine
+            from strategies import create_delta_neutral_strategy
+            import config
+
+            # Create strategy with current settings
+            strategy = create_delta_neutral_strategy(
+                pair_name=config.PAIR_NAME,
+                pair_index=config.PAIR_INDEX,
+                position_size=config.POSITION_SIZE_USDC,
+                leverage=config.LEVERAGE,
+                take_profit_pct=config.TAKE_PROFIT_PNL,
+                stop_loss_pct=config.STOP_LOSS_PNL,
+                entry_offset_min=config.ENTRY_OFFSET_MIN,
+                entry_offset_max=config.ENTRY_OFFSET_MAX,
+                reposition_threshold=config.REPOSITION_THRESHOLD_PCT,
+                check_interval_min=config.CHECK_INTERVAL_MIN,
+                check_interval_max=config.CHECK_INTERVAL_MAX,
+                trading_start_hour=config.TRADING_START_HOUR,
+                trading_end_hour=config.TRADING_END_HOUR,
+                trading_variance=config.TRADING_HOURS_VARIANCE,
+                dry_run=config.DRY_RUN,
+            )
+
+            # Create engine
+            self.engine = TradingEngine(
+                strategy=strategy,
+                rpc_url=config.RPC_URL,
+                private_key=config.PRIVATE_KEY,
+            )
+
+            # Run engine
+            asyncio.run(self.engine.run())
         except Exception as e:
-            self.after(0, lambda: self.log(f"Error: {e}"))
+            err_msg = str(e)
+            self.after(0, lambda msg=err_msg: self.log(f"Error: {msg}"))
+        finally:
+            sys.stdout = old
+            self.after(0, self.stop_bot)
+
+    def run_strategy_thread(self):
+        """Run Funding Reversal strategy in separate thread."""
+        import sys, io
+
+        class R(io.StringIO):
+            def __init__(s, cb): super().__init__(); s.cb = cb
+            def write(s, m):
+                if m.strip(): s.cb(m.strip())
+                return len(m)
+            def flush(s): pass
+
+        old = sys.stdout
+        sys.stdout = R(lambda m: self.after(0, lambda msg=m: self.log(msg)))
+
+        try:
+            from strategies import create_funding_reversal_strategy
+            from run_funding_strategy import StrategyRunner
+            import config
+
+            # Get strategy settings from GUI
+            position_size = self.settings.get("strategy_position_size", 1.0)
+            leverage = self.settings.get("strategy_leverage", 10)
+            stop_loss_pct = self.settings.get("strategy_stop_loss_pct", 0.7)
+            tp1_pct = self.settings.get("strategy_tp1_pct", 1.0)
+            max_trades = self.settings.get("strategy_max_trades", 3)
+
+            self.after(0, lambda: self.log(f"Strategy: ${position_size} x {leverage}x, SL: {stop_loss_pct}%, TP1: {tp1_pct}%"))
+
+            # Create strategy with GUI settings
+            from strategies.funding_reversal import FundingReversalConfig, FundingReversalStrategy
+
+            strategy_config = FundingReversalConfig(
+                dry_run=config.DRY_RUN,
+                position_size=position_size,
+                leverage=leverage,
+                stop_loss_pct=stop_loss_pct,
+                tp1_pct=tp1_pct,
+                max_trades_per_day=max_trades
+            )
+
+            # Create runner
+            self.strategy_runner = StrategyRunner(
+                dry_run=config.DRY_RUN,
+                position_size=position_size,
+                leverage=leverage
+            )
+
+            # Override strategy config
+            self.strategy_runner.strategy.config = strategy_config
+
+            # Run strategy
+            self._strategy_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._strategy_loop)
+            self._strategy_loop.run_until_complete(self.strategy_runner.run())
+
+        except Exception as e:
+            err_msg = str(e)
+            self.after(0, lambda msg=err_msg: self.log(f"Strategy Error: {msg}"))
         finally:
             sys.stdout = old
             self.after(0, self.stop_bot)

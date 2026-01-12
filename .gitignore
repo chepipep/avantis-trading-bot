@@ -8,6 +8,36 @@ license.py
 # Settings with private key
 settings.json
 
+# Real config with your data (use config_example.py as template)
+config.py
+
+# Telegram integration (private feature)
+telegram_bot.py
+telegram_signals.py
+*.session
+
+# ===========================================
+# PRIVATE STRATEGIES & DATA
+# ===========================================
+
+# Binance data fetcher (for advanced strategies)
+binance_data.py
+
+# Advanced strategies (private)
+strategies/funding_reversal.py
+strategies/vwap_mean_reversion.py
+
+# Strategy runners (private)
+run_funding_strategy.py
+run_vwap_strategy.py
+
+# Trade history
+trades_history.py
+trades_history.json
+
+# Temp files
+nul
+
 # ===========================================
 # Python
 # ===========================================
